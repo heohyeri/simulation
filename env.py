@@ -5,33 +5,29 @@ from config import Config
 
 
 class Env:
-    def __init__(self, config: Config):
+    def __init__(self, config):
         self.cfg = config
         self.num_users = config.num_users
         self.num_layers = config.num_layers
         self.layer_rb_counts = config.layer_rb_counts
         self.layer_to_base_rb = config.layer_to_base_rb
 
-        # 시뮬레이션 상태 변수
-        self.t = 0  # 현재 time slot index
-        self.distances = None  # (K,) 사용자 거리
+        self.t = 0  # current time slot index
+        self.distances = None  # (K,) user distances
         self.queues = None  # (K,) 각 사용자 큐 길이
-        self.h = None  # (K, N) 채널 벡터
-        self.snr_linear = None  # (K,) SNR (선형)
+        self.h = None  # (K, N) channel vectors
+        self.snr_linear = None  # (K,) SNR (linear)
 
-    # ------------------------------------------------------------------
-    # 공개 API
-    # ------------------------------------------------------------------
-    def reset(self) -> Dict[str, np.ndarray]:
+    def reset(self):
         """
-        시뮬레이션 초기화 및 초기 state 반환.
+        simulation initialization and return the initial state.
         """
-        # 사용자 거리 샘플링
+        # user distances sampling
         self.distances = np.random.uniform(
             self.cfg.dist_min, self.cfg.dist_max, size=self.num_users
         )
 
-        # 초기 큐 샘플링
+        # initial queues sampling
         self.queues = np.random.uniform(
             self.cfg.queue_min, self.cfg.queue_max, size=self.num_users
         )
@@ -43,32 +39,25 @@ class Env:
 
         return self._get_state()
 
-    def step(self, allocation: List[np.ndarray]) -> Tuple[Dict[str, np.ndarray], float]:
+    def step(self, allocation):
         """
-        한 타임 슬롯 진행.
-
-        Parameters
-        ----------
-        allocation : List[np.ndarray]
-            allocation[l][i] = user index (0 ~ K-1), 또는 -1 (해당 RB 비할당)
-            - len(allocation) == num_layers
-            - allocation[l].shape[0] == layer_rb_counts[l]
-
-        Returns
-        -------
-        next_state : dict
-            다음 슬롯에서의 상태 (거리, 큐, SNR 등)
-        reward : float
-            선택된 objective (rate / pf)에 따른 보상
+        1. allocation 기반 사용자별 rate r_k 계산
+        2. 큐 제약을 고려한 effective rate (r_hat_k) 계산
+        3. Reward 계산(objective: rate or pf)
+        4. 다음 슬롯을 위한 채널 생성
+        5. next_state 반환
         """
+        # allocation 형태 체크
         assert len(allocation) == self.num_layers, "allocation 길이가 num_layers와 다릅니다."
         for l in range(self.num_layers):
             assert allocation[l].shape[0] == self.layer_rb_counts[l], \
                 f"layer {l} 의 RB 개수가 Config와 다릅니다."
 
-        # --------------------------------------------------------------
-        # 1) 현재 슬롯에서 사용자별 rate 계산
-        # --------------------------------------------------------------
+        # 제약 조건 체크
+        self._check_constraints(allocation)
+
+        
+        # 1) 사용자별 rate r_k 계산
         user_rate = np.zeros(self.num_users, dtype=float)  # r_k = Σ r_{l,i}^{(k)}
 
         for l in range(self.num_layers):
@@ -91,9 +80,7 @@ class Env:
 
                 user_rate[k] += r_li_k
 
-        # --------------------------------------------------------------
         # 2) 큐 제약을 고려한 effective rate 및 큐 업데이트
-        # --------------------------------------------------------------
         # r_hat_k = min( r_k, Q_k / T )
         max_rate_from_queue = self.queues / self.cfg.T  # Q_k / T
         effective_rate = np.minimum(user_rate, max_rate_from_queue)
@@ -109,9 +96,7 @@ class Env:
         # 큐 업데이트: Q <- max(Q - transmitted, 0) + arrivals
         self.queues = np.maximum(self.queues - transmitted_amount, 0.0) + arrivals
 
-        # --------------------------------------------------------------
         # 3) 보상 계산 (objective: rate or pf)
-        # --------------------------------------------------------------
         if self.cfg.objective == "rate":
             # Σ_k r_hat_k
             reward = float(np.sum(effective_rate))
@@ -121,19 +106,56 @@ class Env:
         else:
             raise ValueError(f"Unknown objective: {self.cfg.objective}")
 
-        # --------------------------------------------------------------
         # 4) 다음 슬롯을 위한 채널 업데이트
-        # --------------------------------------------------------------
         self.t += 1
         self._generate_channels_and_snr()
 
         next_state = self._get_state()
         return next_state, reward
 
-    # ------------------------------------------------------------------
-    # 내부 헬퍼 함수
-    # ------------------------------------------------------------------
-    def _generate_channels_and_snr(self) -> None:
+    def _check_constraints(self, allocation):
+        K = self.num_users
+
+        # ---------- c1: Σ_{(l,i)} x_{l,i}^{(k)} ≤ 1 ----------
+        user_counts = np.zeros(K, dtype=int)
+
+        for l in range(self.num_layers):
+            for i in range(self.layer_rb_counts[l]):
+                k = int(allocation[l][i])
+                if k < 0:
+                    continue  # 미할당 RB는 무시
+                assert 0 <= k < K, f"잘못된 user index: {k}"
+                user_counts[k] += 1
+
+        if np.any(user_counts > 1):
+            raise AssertionError(
+                f"c1 violation: 어떤 사용자는 여러 RB에 동시에 할당되었습니다. counts={user_counts}"
+            )
+
+        # ---------- c2: δ( Σ_k x_{l,i}^{(k)} e_{l,i} ) ≼ 1_q ----------
+        # base RB(layer0)의 개수만큼 배열 생성
+        q = self.cfg.layer0_rb
+        used_base_rb = np.zeros(q, dtype=bool)
+
+        for l in range(self.num_layers):
+            for i in range(self.layer_rb_counts[l]):
+                k = int(allocation[l][i])
+                if k < 0:
+                    continue  # 미할당 RB는 무시
+
+                base_indices = self.layer_to_base_rb[l][i]  # 이 RB가 차지하는 layer0 index 집합
+                for b_idx in base_indices:
+                    if used_base_rb[b_idx]:
+                        # 이미 사용 중인 base RB를 또 사용 → overlap 발생
+                        raise AssertionError(
+                            f"c2 violation: base RB index {b_idx} 가 두 개 이상의 RB에 의해 사용됨 "
+                            f"(layer={l}, rb={i})"
+                        )
+                    used_base_rb[b_idx] = True
+
+
+
+    def _generate_channels_and_snr(self):
         """
         각 사용자별 채널 벡터 h^(k) 와 SNR Γ^(k) 생성.
         - g^(k) ~ CN(0, I_N)
@@ -162,16 +184,7 @@ class Env:
         # SNR (선형)
         self.snr_linear = (self.cfg.tx_power_watt * h_norm_sq) / self.cfg.noise_power_per_rb
 
-    def _get_state(self) -> Dict[str, np.ndarray]:
-        """
-        학습/실험용 state 반환.
-
-        state 구성:
-        - 't'          : 현재 타임 슬롯 (스칼라, np.array 형태)
-        - 'distances'  : (K,) 사용자 거리
-        - 'queues'     : (K,) 큐 길이
-        - 'snr'        : (K,) 현재 슬롯에서의 사용자별 SNR (선형)
-        """
+    def _get_state(self):
         return {
             "t": np.array(self.t, dtype=int),
             "distances": self.distances.copy(),

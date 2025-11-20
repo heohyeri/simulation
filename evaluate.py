@@ -2,7 +2,144 @@ import re
 from typing import Dict, List, Tuple, Any
 import numpy as np
 
-from env_mimo import MIMOSimConfig, sample_env
+# ============================================================
+# 0. EvalConfig & 어댑터: Env -> 평가용 env(dict)
+# ============================================================
+
+
+class EvalConfig:
+    """
+    evaluate_mapping이 필요로 하는 최소한의 설정만 담는 Config 래퍼.
+
+    - num_users : 사용자 수 K
+    - num_rbs   : 글로벌 RB 개수 R (모든 layer RB 합)
+    - N_ant_ap  : 안테나 수 (no-MIMO에서는 1로 둠)
+    - T         : 슬롯 길이 [초]
+    """
+
+    def __init__(self, num_users: int, num_rbs: int, N_ant_ap: int, T: float):
+        self.num_users = num_users
+        self.num_rbs = num_rbs
+        self.N_ant_ap = N_ant_ap
+        self.T = T
+
+
+def build_eval_env_from_env(env_obj: Any) -> Dict[str, Any]:
+    """
+    Env(env.py의 클래스 인스턴스)를 받아서
+    evaluate_mapping에서 사용할 수 있는 '평가용 env 딕셔너리'로 변환.
+
+    env_obj는 최소한 다음 필드를 가진다고 가정:
+      - env_obj.cfg
+          .num_users
+          .num_layers
+          .layer_rb_counts
+          .layer_to_base_rb
+          .rb_bandwidth
+          .layer0_rb
+          .T
+      - env_obj.snr_linear : (K,) 현재 슬롯의 사용자별 SNR (linear)
+      - env_obj.queues     : (K,) 현재 슬롯의 사용자별 큐 길이 (bits)
+
+    반환되는 딕셔너리는 다음 key를 가짐:
+      - "config"          : EvalConfig 인스턴스
+      - "zf_rates_for_set": callable (rb:int, users:List[int]) -> np.ndarray(len(users),)
+      - "rb_overlap_mask" : (R,R) bool 배열
+      - "G_of_rb"         : (R,) int 배열 (no-MIMO → 전부 1)
+      - "q_backlog_bits"  : (K,) 큐 길이 (bits)
+      - "R_min_bps"       : (K,) 최소속도 또는 None
+    """
+
+    cfg_sim = env_obj.cfg
+    K = cfg_sim.num_users
+    num_layers = cfg_sim.num_layers
+    layer_rb_counts = cfg_sim.layer_rb_counts  # e.g. [37, 16, 8]
+    layer_to_base_rb = cfg_sim.layer_to_base_rb
+    rb_bw = cfg_sim.rb_bandwidth
+    T = cfg_sim.T
+
+    # ---- 글로벌 RB index 매핑 및 RB별 대역폭 B[rb] ----
+    global2li: List[Tuple[int, int]] = []  # g -> (l, i)
+    B_per_rb: List[float] = []
+
+    for l in range(num_layers):
+        cnt = layer_rb_counts[l]
+        for i in range(cnt):
+            global2li.append((l, i))
+            base_rbs = layer_to_base_rb[l][i]  # 예: [0], [0,1], [0,1,2,3]
+            B = len(base_rbs) * rb_bw
+            B_per_rb.append(B)
+
+    R = len(global2li)
+    B_per_rb = np.asarray(B_per_rb, dtype=float)
+
+    # ---- RB 중첩 마스크 (26-tone base RB 기준) ----
+    q = cfg_sim.layer0_rb  # base RB 개수 (26-tone RB 개수)
+    base_masks = np.zeros((R, q), dtype=bool)
+
+    for g, (l, i) in enumerate(global2li):
+        base_indices = layer_to_base_rb[l][i]
+        for b_idx in base_indices:
+            base_masks[g, b_idx] = True
+
+    overlap = np.zeros((R, R), dtype=bool)
+    for a in range(R):
+        for b in range(a + 1, R):
+            if np.any(base_masks[a] & base_masks[b]):
+                overlap[a, b] = True
+                overlap[b, a] = True
+
+    # ---- no-MIMO → 각 RB마다 최대 1명만 허용 ----
+    G_of_rb = np.ones(R, dtype=int)
+
+    # ---- 백로그 (큐) ----
+    if getattr(env_obj, "queues", None) is not None:
+        q_bits = np.asarray(env_obj.queues, dtype=float).reshape(-1)
+    else:
+        q_bits = None
+
+    # ---- SNR (현재 슬롯) ----
+    snr_linear = np.asarray(env_obj.snr_linear, dtype=float).reshape(-1)  # (K,)
+
+    # ---- no-MIMO용 "zf_rates_for_set" 정의 ----
+    def zf_rates_for_set(rb: int, users: List[int]) -> np.ndarray:
+        """
+        원래 MIMO ZF에서는 {users} 집합 전체에 대해 ZF rate를 계산하지만,
+        여기서는 no-MIMO라서 각 RB에는 최대 1명만 할당된다고 가정.
+
+        rate_k(rb) = B_rb * log2(1 + SNR_k)
+
+        users 리스트 길이가 0이면 빈 배열, >=1이면 각 user에 대해 단순 계산.
+        """
+        rates = []
+        B_rb = float(B_per_rb[rb])
+        for u in users:
+            gamma_k = snr_linear[u]
+            r = B_rb * np.log2(1.0 + gamma_k)
+            rates.append(r)
+        return np.asarray(rates, dtype=float)
+
+    # ---- 최소 속도 (QoS) → 여기서는 사용하지 않음 ----
+    R_min = None
+
+    # ---- EvalConfig 생성 ----
+    eval_cfg = EvalConfig(
+        num_users=K,
+        num_rbs=R,
+        N_ant_ap=1,  # no-MIMO
+        T=T,
+    )
+
+    eval_env: Dict[str, Any] = {
+        "config": eval_cfg,
+        "zf_rates_for_set": zf_rates_for_set,
+        "rb_overlap_mask": overlap,
+        "G_of_rb": G_of_rb,
+        "q_backlog_bits": q_bits,
+        "R_min_bps": R_min,
+    }
+    return eval_env
+
 
 # ---------------- Parsing ----------------
 # A) "RB 0 -> users [3,7]"
@@ -11,9 +148,12 @@ _PAT_LINE_MU = re.compile(
     re.IGNORECASE,
 )
 # B) "RB 0 -> user 3"
-_PAT_LINE_SU = re.compile(r"RB\s*(?P<rb>\d+)\s*->\s*user\s*(?P<user>\d+)", re.IGNORECASE)
+_PAT_LINE_SU = re.compile(
+    r"RB\s*(?P<rb>\d+)\s*->\s*user\s*(?P<user>\d+)", re.IGNORECASE
+)
 # C) "(0,3), (1,7)"
 _PAT_TUPL_SU = re.compile(r"\(\s*(?P<rb>\d+)\s*,\s*(?P<user>\d+)\s*\)")
+
 
 def parse_solution(text: str) -> Dict[int, List[int]]:
     """
@@ -42,15 +182,18 @@ def parse_solution(text: str) -> Dict[int, List[int]]:
 
     return {}
 
+
 # ---------------- Helpers to read env ----------------
-def _get_env_views(env: Dict[str, Any], cfg: MIMOSimConfig):
+def _get_env_views(env: Dict[str, Any], cfg: Any):
     R = cfg.num_rbs
     K = cfg.num_users
 
-    # ZF 헬퍼 함수 (env_mimo에서 제공)
+    # RB 집합에 대한 rate를 계산하는 콜백 함수
     zf_rates_for_set = env.get("zf_rates_for_set", None)
     if zf_rates_for_set is None:
-        raise KeyError("env must provide 'zf_rates_for_set' from env_mimo.sample_env().")
+        raise KeyError(
+            "env must provide 'zf_rates_for_set' from env_mimo.sample_env()."
+        )
 
     # RB 중첩 마스크(없으면 비중첩)
     overlap = env.get("rb_overlap_mask", np.zeros((R, R), dtype=bool))
@@ -68,15 +211,18 @@ def _get_env_views(env: Dict[str, Any], cfg: MIMOSimConfig):
 
     return zf_rates_for_set, overlap, G_of_rb, q_bits, T, R_min
 
+
 # ---------------- Constraint checks ----------------
-def check_constraints(mapping: Dict[int, List[int]], env: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def check_constraints(
+    mapping: Dict[int, List[int]], env: Dict[str, Any]
+) -> Tuple[bool, List[str]]:
     """
     c1) 한 유저는 최대 1개 RB만
     c2) 중첩 RB 금지
     c3) 각 RB에서 동시 사용자 수 ≤ G(rb)
     + 인덱스/형식/줄수 검사
     """
-    cfg: MIMOSimConfig = env["config"]
+    cfg = env["config"]
     K, R = cfg.num_users, cfg.num_rbs
     msgs: List[str] = []
 
@@ -100,14 +246,18 @@ def check_constraints(mapping: Dict[int, List[int]], env: Dict[str, Any]) -> Tup
     # c3) RB별 동시 사용자 수 제한
     for rb, users in mapping.items():
         if len(users) > int(G_of_rb[rb]):
-            msgs.append(f"Constraint c3 violated at RB {rb}: {len(users)} users > G({rb})={int(G_of_rb[rb])}.")
+            msgs.append(
+                f"Constraint c3 violated at RB {rb}: {len(users)} users > G({rb})={int(G_of_rb[rb])}."
+            )
 
     # c1) 유저 중복 배정 금지
     seen = {}
     for rb, users in mapping.items():
         for u in users:
             if u in seen:
-                msgs.append(f"Constraint c1 violated: user {u} on RB {seen[u]} and RB {rb}.")
+                msgs.append(
+                    f"Constraint c1 violated: user {u} on RB {seen[u]} and RB {rb}."
+                )
             else:
                 seen[u] = rb
 
@@ -121,6 +271,7 @@ def check_constraints(mapping: Dict[int, List[int]], env: Dict[str, Any]) -> Tup
 
     ok = len(msgs) == 0
     return ok, msgs
+
 
 # ---------------- Scoring ----------------
 def evaluate_mapping(
@@ -137,7 +288,7 @@ def evaluate_mapping(
       objective ∈ {"rate","pf"}:
          rate: ∑ r_hat(k),   pf: ∑ log(1 + r_hat(k))
     """
-    cfg: MIMOSimConfig = env["config"]
+    cfg = env["config"]
     K, R = cfg.num_users, cfg.num_rbs
     zf_rates_for_set, overlap, G_of_rb, q_bits, T, R_min = _get_env_views(env, cfg)
 
@@ -145,8 +296,7 @@ def evaluate_mapping(
 
     # 🔴 인덱스 에러 방어: 잘못된 RB/유저 인덱스가 있으면 ZF 계산 전에 바로 종료
     has_invalid_index = any(
-        ("Invalid RB index" in v) or ("Invalid user index" in v)
-        for v in violations
+        ("Invalid RB index" in v) or ("Invalid user index" in v) for v in violations
     )
     if has_invalid_index:
         r_th = np.zeros(K, dtype=float)
@@ -174,7 +324,6 @@ def evaluate_mapping(
             "mapping": mapping,
             "G_of_rb": np.asarray(G_of_rb).tolist(),
         }
-
 
     # --- r_th 계산 ---
     r_th = np.zeros(K, dtype=float)
@@ -219,7 +368,7 @@ def evaluate_mapping(
         raise ValueError("objective must be 'rate' or 'pf'")
 
     # 최종 ok 재계산
-    ok = (len(violations) == 0)
+    ok = len(violations) == 0
 
     # 정책: 위반 시 점수 0 처리 옵션
     if zero_on_violation and not ok:
@@ -237,16 +386,20 @@ def evaluate_mapping(
         "G_of_rb": np.asarray(G_of_rb).tolist(),
     }
 
+
 # ---------------- Prompt helpers ----------------
 def summarize_env_for_prompt(env: Dict[str, Any]) -> str:
-    cfg: MIMOSimConfig = env["config"]
+    cfg = env["config"]
     R, K, N = cfg.num_rbs, cfg.num_users, cfg.N_ant_ap
     G_of_rb = env.get("G_of_rb", np.full(R, N, dtype=int))
     overlap = env.get("rb_overlap_mask", np.zeros((R, R), dtype=bool))
     q_bits = env.get("q_backlog_bits", None)
 
     lines = []
-    lines.append(f"MIMO(N={N}), RBs={R}, Users={K}, T={cfg.T*1e3:.2f} ms")
+    lines.append(
+        f"No-MIMO uplink OFDMA (single-antenna users, N_rx={N}), "
+        f"RBs={R}, T={cfg.T*1e3:.2f} ms"
+    )
     lines.append("Per-RB user limit G(rb): " + ", ".join(str(int(g)) for g in G_of_rb))
     ov_pairs = [
         f"({i},{j})" for i in range(R) for j in range(i + 1, R) if bool(overlap[i, j])
@@ -257,6 +410,7 @@ def summarize_env_for_prompt(env: Dict[str, Any]) -> str:
         lines.append("Backlog-aware scoring enabled (uses q_bits/T).")
     lines.append("Output one line per RB, e.g. 'RB 0 -> users [3,7]' or [] if empty.")
     return "\n".join(lines)
+
 
 def target_format_example(num_rbs=9, G_of_rb: List[int] = None) -> str:
     if G_of_rb is None:
@@ -280,10 +434,13 @@ Rules:
 - Use empty list [] if you do not assign any user to an RB.
 """
 
+
 def summarize_feedback(eval_result: Dict[str, Any]) -> str:
     obj_str = eval_result["objective"]
     score = eval_result["score"]
-    score_str = f"{score/1e6:.3f} Mbps" if obj_str == "rate" else f"{score:.3f} (LogSum)"
+    score_str = (
+        f"{score/1e6:.3f} Mbps" if obj_str == "rate" else f"{score:.3f} (LogSum)"
+    )
 
     parts = [f"Score (Objective={obj_str}): {score_str}"]
     if eval_result["ok"]:
@@ -292,32 +449,3 @@ def summarize_feedback(eval_result: Dict[str, Any]) -> str:
         for v in eval_result["violations"]:
             parts.append(v)
     return "\n".join(parts)
-
-# ---------------- Demo ----------------
-def _demo():
-    cfg = MIMOSimConfig()
-    env = sample_env(cfg, seed=42)
-
-    # 간단 예시 답안: RB마다 최대 G(rb)만큼 연속 사용자 배치 (데모 전용)
-    G = env.get("G_of_rb", np.full(cfg.num_rbs, cfg.N_ant_ap, dtype=int))
-    mapping = {}
-    next_user = 0
-    for rb in range(cfg.num_rbs):
-        g = int(G[rb])
-        users = list(range(next_user, min(next_user + g, cfg.num_users)))
-        next_user += g
-        mapping[rb] = users
-
-    # 채점
-    result_rate = evaluate_mapping(mapping, env, objective="rate", zero_on_violation=False)
-    result_pf = evaluate_mapping(mapping, env, objective="pf", zero_on_violation=False)
-
-    print("--- ENV SUMMARY ---")
-    print(summarize_env_for_prompt(env))
-    print("\n--- Evaluating 'rate' objective ---")
-    print(summarize_feedback(result_rate))
-    print("\n--- Evaluating 'pf' objective ---")
-    print(summarize_feedback(result_pf))
-
-if __name__ == "__main__":
-    _demo()
